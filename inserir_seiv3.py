@@ -1,276 +1,312 @@
+# -*- coding: utf-8 -*-
+"""
+Este script automatiza o processo de upload de documentos para o sistema SEI
+(Sistema Eletrônico de Informações).
+
+Funcionalidades Principais:
+1.  Lê uma planilha Excel para obter uma lista de números de processo SEI e
+    seus respectivos números de instrumento.
+2.  Conecta-se a uma sessão do Google Chrome já aberta em modo de depuração para
+    interagir com uma sessão autenticada do SEI.
+3.  Para cada processo, localiza uma pasta correspondente no sistema de arquivos local
+    baseado no número do instrumento.
+4.  Itera sobre todos os arquivos PDF e ZIP dentro da pasta encontrada.
+5.  Para cada arquivo, o robô navega no SEI, abre o formulário de "Documento Externo",
+    preenche os metadados (tipo "Anexo", data atual, nato-digital, público) e
+    realiza o upload do arquivo.
+6.  Mantém um log em formato JSON (`upload_log.json`) para rastrear os arquivos
+    já enviados e evitar uploads duplicados.
+
+Pré-requisitos:
+- Python 3.x
+- Bibliotecas: pandas, selenium, webdriver-manager
+- Google Chrome instalado.
+- Uma instância do Chrome deve ser iniciada com a depuração remota ativada.
+  Exemplo de comando (Windows):
+  "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="C:\ChromeDebug"
+"""
+
 import os
 import time
 import glob
+import json
 import pandas as pd
-
 from datetime import date
 from selenium import webdriver
-from selenium.common import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import WebDriverException, TimeoutException
 
+# --- Bloco de Configuração ---
+# Centraliza caminhos e parâmetros para fácil manutenção.
+CONFIG = {
+    "caminho_excel": r"C:\Users\diego.brito\Downloads\teste_sei\RTMA Passivo 2024 - PROJETOS E PROGRAMAS 1.xlsx",
+    "caminho_base_documentos": r"C:\Users\diego.brito\OneDrive - Ministério do Desenvolvimento e Assistência Social\Documentos\ambiente de testes",
+    "arquivo_log": "upload_log.json",
+    "porta_debugger": 9222,
+    "timeout_geral": 20  # Tempo máximo de espera para elementos da página em segundos
+}
 
+# Centraliza os seletores do SEI para facilitar atualizações caso a interface mude.
+SEI_SELECTORS = {
+    "campo_pesquisa_rapida": "txtPesquisaRapida",
+    "iframe_visualizacao": "ifrVisualizacao",
+    "link_novo_documento": "#divArvoreAcoes a[href*='controlador.php?acao=documento_escolher_tipo']",
+    "tabela_tipos_documento": "#tblSeries > tbody > tr:nth-child(1)",
+    "dropdown_tipo_anexo": "#selSerie",
+    "campo_data_elaboracao": "txtDataElaboracao",
+    "checkbox_nato_digital": "lblNato",
+    "checkbox_publico": "lblPublico",
+    "campo_nome_arquivo": "txtNumero",
+    "campo_upload_arquivo": "filArquivo",
+    "botao_salvar": "btnSalvar",
+    "iframe_progresso_upload": "ifrProgressofrmAnexos"
+}
 
+# --- Funções Auxiliares ---
 
-
-
-# --- Função para conectar ao navegador já aberto com modo debugger ---
-def conectar_navegador_existente(porta: int = 9222):
+def conectar_navegador_existente(porta):
     """
-    Conecta a uma instância do Google Chrome já em execução na porta de depuração especificada.
+    Conecta a uma instância do Google Chrome em execução na porta de depuração especificada.
+
+    Args:
+        porta (int): O número da porta onde o modo de depuração do Chrome está rodando.
+
+    Returns:
+        webdriver.Chrome or None: Retorna o objeto do driver do navegador se a conexão
+                                  for bem-sucedida, caso contrário, retorna None.
     """
     try:
-        print(f"Tentando conectar ao navegador na porta {porta}...")
+        print(f"[INFO] Tentando conectar ao navegador na porta {porta}...")
         opcoes_chrome = Options()
         opcoes_chrome.add_experimental_option("debuggerAddress", f"localhost:{porta}")
         navegador = webdriver.Chrome(options=opcoes_chrome)
-        print(" X.X Conectado ao navegador existente com sucesso!")
+        print("[SUCCESS] Conectado ao navegador existente com sucesso!")
         return navegador
     except WebDriverException:
-        print(" Erro ao conectar. Verifique se o Chrome está aberto com depuração:")
-        print(f'chrome.exe --remote-debugging-port={porta} --user-data-dir="C:\\ChromeDebugProfile"')
+        print("[ERROR] Falha ao conectar. Verifique se o Chrome está aberto com o modo de depuração ativado.")
+        print(f'          Exemplo: chrome.exe --remote-debugging-port={porta} --user-data-dir="C:\\ChromeDebugProfile"')
         return None
     except Exception as e:
-        print(f"Erro inesperado: {e}")
+        print(f"[ERROR] Ocorreu um erro inesperado ao tentar conectar ao navegador: {e}")
         return None
 
+def carregar_log_envio(caminho_arquivo):
+    """
+    Carrega o log de arquivos já enviados a partir de um arquivo JSON.
 
-import json
+    Args:
+        caminho_arquivo (str): O caminho para o arquivo de log.
 
-LOG_ARQUIVOS = "upload_log.json"
-
-def carregar_log_envio():
-    if os.path.exists(LOG_ARQUIVOS):
-        with open(LOG_ARQUIVOS, "r", encoding="utf-8") as f:
+    Returns:
+        dict: Um dicionário com o histórico de uploads. Retorna um dicionário
+              vazio se o arquivo não existir.
+    """
+    if os.path.exists(caminho_arquivo):
+        with open(caminho_arquivo, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def salvar_log_envio(log):
-    with open(LOG_ARQUIVOS, "w", encoding="utf-8") as f:
-        json.dump(log, f, ensure_ascii=False, indent=2)
+def salvar_log_envio(log_data, caminho_arquivo):
+    """
+    Salva o dicionário de log de envios em um arquivo JSON.
 
-# --- INÍCIO SCRIPT PRINCIPAL ---
+    Args:
+        log_data (dict): O dicionário contendo o log atualizado.
+        caminho_arquivo (str): O caminho onde o arquivo de log será salvo.
+    """
+    with open(caminho_arquivo, "w", encoding="utf-8") as f:
+        json.dump(log_data, f, ensure_ascii=False, indent=4)
 
+def navegar_e_preparar_formulario(navegador, wait, processo_sei):
+    """
+    Realiza a sequência de navegação no SEI para chegar até o formulário de upload
+    de documento externo e preenche os campos comuns.
 
-# Caminho do Excel atualizado
-caminho_excel = r"C:\Users\diego.brito\Downloads\teste_sei\RTMA Passivo 2024 - PROJETOS E PROGRAMAS 1.xlsx"
+    Args:
+        navegador (webdriver.Chrome): A instância do driver do Selenium.
+        wait (WebDriverWait): A instância do objeto de espera explícita.
+        processo_sei (str): O número do processo a ser buscado.
 
-# Caminho base onde estão os documentos
-caminho_base = r"C:\Users\diego.brito\OneDrive - Ministério do Desenvolvimento e Assistência Social\Documentos\ambiente de testes"
-
-# Conecta ao navegador já aberto
-navegador_conectado = conectar_navegador_existente()
-
-
-if not navegador_conectado:
-    print("⚠ Navegador não conectado. Encerrando script.")
-    exit()
-
-# Carrega os dados do Excel
-df = pd.read_excel(caminho_excel)
-lista_processos = df['Processo SEI (nº)'].dropna().tolist()  # remove vazios
-
-print(f" Total de processos encontrados: {len(lista_processos)}")
-
-
-log_envios = carregar_log_envio()
-
-# Loop principal de processos
-for processo in lista_processos:
+    Returns:
+        bool: True se a preparação foi bem-sucedida, False caso contrário.
+    """
     try:
-        print(f"\n🟡 Iniciando automação para o processo: {processo}")
-        wait = WebDriverWait(navegador_conectado, 15)
+        # Garante que o foco está no conteúdo principal antes de cada nova ação.
+        navegador.switch_to.default_content()
 
-        if processo not in log_envios:
-            log_envios[processo] = []
-
-
-        # Localiza e interage com o campo de busca
-        campo_busca = wait.until(EC.presence_of_element_located((By.ID, "txtPesquisaRapida")))
+        # Realiza a busca pelo processo
+        campo_busca = wait.until(EC.presence_of_element_located((By.ID, SEI_SELECTORS["campo_pesquisa_rapida"])))
         campo_busca.clear()
-        campo_busca.send_keys(str(processo))
+        campo_busca.send_keys(str(processo_sei))
         campo_busca.send_keys(Keys.ENTER)
-        print(" Pesquisa enviada.")
+        print("[INFO] Pesquisa pelo processo enviada.")
 
-        # Acessa o iframe onde está a árvore de ações
-        wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "ifrVisualizacao")))
-        print(" Foco alterado para o iframe.")
+        # O conteúdo principal do processo está dentro de um iframe. É necessário mudar o contexto.
+        wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, SEI_SELECTORS["iframe_visualizacao"])))
+        print("[INFO] Contexto alterado para o iframe de visualização.")
 
-        # Clica no botão de novo documento externo
-        seletor_link = "#divArvoreAcoes a[href*='controlador.php?acao=documento_escolher_tipo']"
-        botao_novo_doc = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, seletor_link)))
+        # Clica no ícone para incluir um novo documento
+        botao_novo_doc = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, SEI_SELECTORS["link_novo_documento"])))
         botao_novo_doc.click()
-        print(" Clique no botão 'Novo Documento' feito com sucesso.")
+        print("[INFO] Navegando para a tela de escolha de tipo de documento.")
 
-        # Espera o botão externo e clica nele
-        wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "infraTrClara")))
-        btn_externo_css = "#tblSeries > tbody > tr:nth-child(1)"
-        navegador_conectado.find_element(By.CSS_SELECTOR, btn_externo_css).click()
-        print(" Documento externo selecionado.")
+        # Na nova tela, seleciona o tipo "Documento Externo"
+        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, SEI_SELECTORS["tabela_tipos_documento"]))).click()
+        print("[INFO] Tipo 'Documento Externo' selecionado.")
 
-        # Seleciona o tipo de documento como "Anexo"
-        dropdown_element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#selSerie")))
-        select = Select(dropdown_element)
-        select.select_by_visible_text("Anexo")
-        print(" Tipo de documento 'Anexo' selecionado.")
+        # Preenche os campos padrão do formulário
+        dropdown_element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, SEI_SELECTORS["dropdown_tipo_anexo"])))
+        Select(dropdown_element).select_by_visible_text("Anexo")
+        print("[INFO] Tipo de documento definido como 'Anexo'.")
 
-        time.sleep(3)
-        # Preenche data com data atual
         data_atual = date.today().strftime("%d/%m/%Y")
-        campo_data = navegador_conectado.find_element(By.ID, "txtDataElaboracao")
+        campo_data = navegador.find_element(By.ID, SEI_SELECTORS["campo_data_elaboracao"])
         campo_data.clear()
         campo_data.send_keys(data_atual)
-        print(f" Data preenchida: {data_atual}")
+        print(f"[INFO] Data de elaboração preenchida com: {data_atual}")
 
-        # Marca como nato-digital
-        navegador_conectado.find_element(By.ID, "lblNato").click()
-        print(" Marcado como Nato-Digital.")
+        navegador.find_element(By.ID, SEI_SELECTORS["checkbox_nato_digital"]).click()
+        print("[INFO] Documento marcado como 'Nato-Digital'.")
 
-        # Marca como público
-        navegador_conectado.find_element(By.ID, "lblPublico").click()
-        print(" Marcado como Público.")
+        navegador.find_element(By.ID, SEI_SELECTORS["checkbox_publico"]).click()
+        print("[INFO] Nível de acesso definido como 'Público'.")
 
-        # zzzVerifica o número do instrumento no DataFrame
-        instrumento_match = df.loc[df['Processo SEI (nº)'] == processo, 'Instrumento nº']
-        if instrumento_match.empty:
-            print(" Instrumento não encontrado no Excel.")
-            navegador_conectado.switch_to.default_content()
-            continue
+        return True
 
-        numero_instrumento = str(instrumento_match.values[0])
-        print(f" Procurando subpastas com número do instrumento: {numero_instrumento}")
+    except TimeoutException:
+        print("[ERROR] Tempo de espera excedido ao tentar localizar um elemento durante a navegação.")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Erro inesperado durante a preparação do formulário: {e}")
+        return False
 
-        # Lista subpastas que contenham o número do instrumento
-        subpastas = [p for p in os.listdir(caminho_base) if os.path.isdir(os.path.join(caminho_base, p))]
-        pastas_compativeis = [p for p in subpastas if numero_instrumento in p]
+# --- Script Principal ---
 
-        if not pastas_compativeis:
-            print(f"⚠ Nenhuma pasta com '{numero_instrumento}' encontrada.")
-            navegador_conectado.switch_to.default_content()
-            continue
+def main():
+    """
+    Orquestra todo o processo de automação.
+    """
+    navegador = conectar_navegador_existente(CONFIG["porta_debugger"])
+    if not navegador:
+        print("[ERROR] Não foi possível conectar ao navegador. Encerrando o script.")
+        return
 
-        for pasta in pastas_compativeis:
-            caminho_pasta = os.path.join(caminho_base, pasta)
-            print(f" Explorando pasta: {caminho_pasta}")
+    try:
+        df = pd.read_excel(CONFIG["caminho_excel"])
+        # Garante que a coluna de processos não tenha valores nulos antes de converter para lista
+        lista_processos = df['Processo SEI (nº)'].dropna().astype(str).tolist()
+        print(f"[INFO] Planilha carregada. {len(lista_processos)} processos encontrados.")
+    except FileNotFoundError:
+        print(f"[ERROR] O arquivo Excel não foi encontrado no caminho: {CONFIG['caminho_excel']}")
+        return
+    except Exception as e:
+        print(f"[ERROR] Falha ao ler o arquivo Excel: {e}")
+        return
 
-            arquivos = sorted([
-                f for f in glob.glob(os.path.join(caminho_pasta, '**', '*.*'), recursive=True)
-                if f.lower().endswith(('.pdf', '.zip'))
-            ])
+    log_envios = carregar_log_envio(CONFIG["arquivo_log"])
+    wait = WebDriverWait(navegador, CONFIG["timeout_geral"])
 
-            if not arquivos:
-                print(f"⚠ Nenhum arquivo PDF ou ZIP em: {caminho_pasta}")
+    # Itera sobre cada processo da planilha
+    for processo in lista_processos:
+        try:
+            print("-" * 60)
+            print(f"[INFO] Iniciando automação para o processo: {processo}")
+
+            # Inicializa o log para o processo se ele for novo
+            if processo not in log_envios:
+                log_envios[processo] = []
+
+            # Encontra o número do instrumento associado ao processo no DataFrame
+            instrumento_match = df.loc[df['Processo SEI (nº)'] == processo, 'Instrumento nº']
+            if instrumento_match.empty:
+                print(f"[WARNING] Número do instrumento não encontrado para o processo {processo}. Pulando.")
                 continue
 
-            for arquivo in arquivos:
-                nome_arquivo = os.path.basename(arquivo)
+            numero_instrumento = str(instrumento_match.values[0])
+            print(f"[INFO] Procurando pastas de documentos para o instrumento: {numero_instrumento}")
 
-                # Verifica se já foi enviado
-                if nome_arquivo in log_envios[processo]:
-                    print(f"⚠️ Arquivo já enviado anteriormente: {nome_arquivo} — pulando.")
+            # Busca pastas no diretório base que contenham o número do instrumento
+            subpastas = [p for p in os.listdir(CONFIG["caminho_base_documentos"]) if os.path.isdir(os.path.join(CONFIG["caminho_base_documentos"], p))]
+            pastas_compativeis = [p for p in subpastas if numero_instrumento in p]
+
+            if not pastas_compativeis:
+                print(f"[WARNING] Nenhuma pasta de documentos encontrada contendo '{numero_instrumento}'.")
+                continue
+
+            # Itera sobre cada pasta de documento encontrada
+            for pasta in pastas_compativeis:
+                caminho_pasta = os.path.join(CONFIG["caminho_base_documentos"], pasta)
+                print(f"[INFO] Analisando a pasta: {caminho_pasta}")
+
+                # Busca recursivamente por arquivos PDF e ZIP dentro da pasta
+                arquivos_para_upload = sorted([
+                    f for f in glob.glob(os.path.join(caminho_pasta, '**', '*.*'), recursive=True)
+                    if f.lower().endswith(('.pdf', '.zip'))
+                ])
+
+                if not arquivos_para_upload:
+                    print(f"[INFO] Nenhum arquivo .pdf ou .zip encontrado em: {caminho_pasta}")
                     continue
 
-                try:
-                    print(f"\n📄 Iniciando envio do arquivo: {nome_arquivo}")
+                # Itera sobre cada arquivo a ser enviado
+                for caminho_completo_arquivo in arquivos_para_upload:
+                    nome_arquivo = os.path.basename(caminho_completo_arquivo)
 
-                    # Garante que está no contexto principal antes de tudo
-                    navegador_conectado.switch_to.default_content()
+                    if nome_arquivo in log_envios[processo]:
+                        print(f"[WARNING] O arquivo '{nome_arquivo}' já foi enviado anteriormente para este processo. Pulando.")
+                        continue
 
-                    # 🔁 Refaz a busca do processo
-                    campo_busca = wait.until(EC.presence_of_element_located((By.ID, "txtPesquisaRapida")))
-                    campo_busca.clear()
-                    campo_busca.send_keys(str(processo))
-                    campo_busca.send_keys(Keys.ENTER)
-                    print("🔍 Pesquisa enviada.")
+                    print(f"\n[INFO] Preparando para enviar o arquivo: {nome_arquivo}")
 
-                    # Acessa novamente o iframe com a árvore
-                    wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "ifrVisualizacao")))
-                    print("📥 Foco alterado para o iframe.")
+                    # A cada novo arquivo, refaz a navegação para garantir que a interface está no estado esperado.
+                    if not navegar_e_preparar_formulario(navegador, wait, processo):
+                        print("[ERROR] Falha ao preparar o formulário. Pulando para o próximo arquivo.")
+                        continue
 
-                    # Clica no botão "Novo Documento"
-                    seletor_link = "#divArvoreAcoes a[href*='controlador.php?acao=documento_escolher_tipo']"
-                    botao_novo_doc = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, seletor_link)))
-                    botao_novo_doc.click()
-                    print("📄 Clique no botão 'Novo Documento' executado.")
-
-                    # Espera o tipo "Documento Externo" e clica na primeira linha
-                    wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "infraTrClara")))
-                    btn_externo_css = "#tblSeries > tbody > tr:nth-child(1)"
-                    navegador_conectado.find_element(By.CSS_SELECTOR, btn_externo_css).click()
-                    print("📄 Documento externo selecionado.")
-
-                    # Seleciona o tipo "Anexo"
-                    dropdown_element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#selSerie")))
-                    select = Select(dropdown_element)
-                    select.select_by_visible_text("Anexo")
-                    print("📄 Tipo de documento 'Anexo' selecionado.")
-
-                    # Preenche a data atual no campo correspond
-                    time.sleep(1)
-                    data_atual = date.today().strftime("%d/%m/%Y")
-                    campo_data = navegador_conectado.find_element(By.ID, "txtDataElaboracao")
-                    campo_data.clear()
-                    campo_data.send_keys(data_atual)
-                    print(f"📅 Data preenchida com: {data_atual}")
-
-                    # Marca como Nato-Digital
-                    checkbox_nato = navegador_conectado.find_element(By.ID, "lblNato")
-                    checkbox_nato.click()
-                    print("✅ Marcado como Nato-Digital.")
-
-                    # Marca como Público
-                    checkbox_publico = navegador_conectado.find_element(By.ID, "lblPublico")
-                    checkbox_publico.click()
-                    print("✅ Marcado como Público.")
-
-                    # Preenche o campo "txtNumero" com o nome do arquivo
+                    # Preenche os campos específicos do arquivo e realiza o upload
                     try:
-                        campo_numero = wait.until(EC.presence_of_element_located((By.ID, "txtNumero")))
-                        campo_numero.clear()
-                        campo_numero.send_keys(nome_arquivo)
-                        print(f"📝 Campo 'txtNumero' preenchido com: {nome_arquivo}")
-                    except Exception as e:
-                        print(f"❌ Erro ao preencher o campo 'txtNumero': {e}")
-                        continue  # Pula para o próximo arquivo se falhar
+                        campo_nome = wait.until(EC.presence_of_element_located((By.ID, SEI_SELECTORS["campo_nome_arquivo"])))
+                        campo_nome.clear()
+                        campo_nome.send_keys(nome_arquivo)
+                        print(f"[INFO] Nome do anexo preenchido com: '{nome_arquivo}'")
 
-                    # Envia o arquivo para o campo de upload
-                    campo_upload = wait.until(EC.presence_of_element_located((By.ID, "filArquivo")))
-                    campo_upload.send_keys(arquivo)
-                    print(f"📤 Arquivo enviado para o campo de upload: {arquivo}")
+                        campo_upload = navegador.find_element(By.ID, SEI_SELECTORS["campo_upload_arquivo"])
+                        campo_upload.send_keys(caminho_completo_arquivo)
+                        print(f"[INFO] Arquivo '{caminho_completo_arquivo}' selecionado para upload.")
 
-                    # Confirma os dados preenchidos
-                    botao_confirmar = wait.until(EC.element_to_be_clickable((By.ID, "btnSalvar")))
-                    botao_confirmar.click()
-                    print("🆗 Clique em 'Confirmar Dados' executado.")
+                        navegador.find_element(By.ID, SEI_SELECTORS["botao_salvar"]).click()
+                        print("[INFO] Botão 'Confirmar Dados' clicado. Aguardando finalização do upload...")
 
-                    # Aguarda o iframe de progresso sumir, indicando fim do upload
-                    WebDriverWait(navegador_conectado, 30).until(
-                        EC.invisibility_of_element_located((By.ID, "ifrProgressofrmAnexos"))
-                    )
-                    print("✅ Upload finalizado com sucesso.")
+                        # Aguarda o desaparecimento da barra de progresso, indicando que o upload terminou.
+                        wait.until(EC.invisibility_of_element_located((By.ID, SEI_SELECTORS["iframe_progresso_upload"])))
+                        print(f"[SUCCESS] Upload do arquivo '{nome_arquivo}' finalizado com sucesso.")
 
-                    # Salva o nome do arquivo no log de envios
-                    log_envios[processo].append(nome_arquivo)
-                    salvar_log_envio(log_envios)
-                    print(f"📝 Arquivo registrado no log: {nome_arquivo}")
+                        # Registra o sucesso no log
+                        log_envios[processo].append(nome_arquivo)
+                        salvar_log_envio(log_envios, CONFIG["arquivo_log"])
+                        print("[INFO] Log de envio atualizado.")
 
-                except Exception as erro_arquivo:
-                    print(f"❌ Erro ao processar o arquivo: {nome_arquivo}")
-                    print(f"   ➤ Detalhes: {erro_arquivo}")
-                    navegador_conectado.switch_to.default_content()
-                    continue
+                    except Exception as erro_upload:
+                        print(f"[ERROR] Falha durante o processo de upload do arquivo '{nome_arquivo}'.")
+                        print(f"          Detalhes: {erro_upload}")
+                        # Garante que o robô volte ao estado inicial para a próxima tentativa
+                        navegador.switch_to.default_content()
+                        continue
+
+        except Exception as erro_processo:
+            print(f"[ERROR] Ocorreu um erro geral e inesperado ao processar o processo {processo}.")
+            print(f"          Detalhes: {erro_processo}")
+            # Tenta se recuperar voltando ao contexto padrão do navegador
+            navegador.switch_to.default_content()
+            continue
+
+    print("-" * 60)
+    print("[SUCCESS] Todos os processos da planilha foram verificados.")
 
 
-    except Exception as e:
-        print(f"❌ Erro geral no processo {processo}: {e}")
-        navegador_conectado.switch_to.default_content()
-        continue
-
-print(" Todos os processos foram finalizados com sucesso! :)")
-navegador_conectado.quit()
-
+if __name__ == "__main__":
+    main()
